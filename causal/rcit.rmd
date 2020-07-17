@@ -1,0 +1,224 @@
+---
+title: "R Notebook"
+output:
+  html_document: default
+  html_notebook: default
+  pdf_document: default
+---
+
+First I set up my functions.  The function *xi* produces a random function.  
+
+```{r}
+xi<-function(d2){
+  #output should be a function that takes a d1*d2 matrix
+  w<-matrix(rnorm(d2,0,0.1),d2,1)
+  b<-runif(1,0,2*pi)
+  out<-function(z){sqrt(2)*cos(z%*%w+b)}
+  out
+}
+
+
+```
+
+
+The next function produces a test data set.  The first two (*a*) columns are mltivariate normal with a random covariance matrix.  The 5th and 6th columns (*c*) columns depend on the *a* columns, and columns 3:4 (the *b* columns) deoend direcly on the *c* columns. It is true that $a \perp\!\!\!\perp b | c$.  
+
+```{r}
+
+makeTestDat<-function(nsiz=100000){
+  ncola=2
+  ncolb=2
+  ncolc=2
+  nsiz<-100000
+  acols<-1:ncola
+  bcols<-(ncola+1):(ncola+ncolb)
+  ccols<-(ncola+ncolb+1):(ncola+ncolb+ncolc)
+  trydat<-matrix(0,nsiz,sum(c(ncola,ncolb,ncolc)))
+  trydat[,acols]<-matrix(rnorm(ncola*nsiz,0,10),nsiz)%*%matrix(rnorm(4),2)
+  trydat[,ccols]<-sqrt(1+trydat[,acols]^2)+matrix(rnorm(ncolc*nsiz,0,1),nsiz)%*%matrix(rnorm(4),2)
+  trydat[,bcols]<-trydat[,ccols]*(1+matrix(rnorm(ncolb*nsiz,0,0.1),nsiz))%*%matrix(rnorm(4),2)
+  trydat<-data.frame(trydat)
+  names(trydat)<-c("a1","a2","b1","b2","c1","c2")
+  return(trydat)
+}
+
+```
+
+The next function makes the transformed data set, using the random function *xi*.
+```{r}
+makeRBaseDat<-function(trydat,rbasis=xi,ncolv=list(acols,bcols,ccols)){
+#  ncolv=list(acols,bcols,ccols)
+  acols<-ncolv[[1]]
+  bcols<-ncolv[[2]]
+  ccols<-ncolv[[3]]
+  nsiz=nrow(trydat)
+  codtstdat<-matrix(0,nsiz,12)
+  codtstdat<-data.frame((codtstdat))
+  names(codtstdat)<-list()
+  for(i in 1:4){
+    rfun<-rbasis(length(acols))
+    codtstdat[,i]<-rfun(as.matrix(trydat[,acols]))
+    names(codtstdat)[i]<-paste("a",i,sep="")
+    
+  }
+  for(i in 1:4){
+    rfun<-rbasis(length(ccols))
+    codtstdat[,i+4]<-rfun(as.matrix(trydat[,ccols]))
+    names(codtstdat)[i+4]<-paste("c",i,sep="")
+  }
+  for(i in 1:4){
+    rfun<-xi(length(bcols))
+    codtstdat[,i+8]<-rfun(as.matrix(trydat[,bcols]))
+    names(codtstdat)[i+8]<-paste("b",i,sep="")
+  }
+  return(codtstdat)
+}
+```
+
+Make the set with the cross product, with which we get the covariance matrix for the vectorized covariance matrix.
+
+```{r}
+
+makeCrossDat<-function(codtstdat){
+  nsiz<-nrow(codtstdat)
+  crossp<-data.frame(matrix(0,nsiz,144))
+  grpv<-rep(c("a","c","b"),each=4)
+  colind<-1
+  for(i in 1:ncol(codtstdat)){
+    for(j in 1:ncol(codtstdat)){
+      crossp[,colind]<-codtstdat[,i]*codtstdat[,j]
+      nm<-""
+      ip<-i%%4+4*(i%%4==0)
+      jp<-j%%4+4*(j%%4==0)
+      names(crossp)[colind]<-paste(grpv[i],ip,grpv[j],jp,sep="")
+      colind<-colind+1
+    }
+  }
+  return(crossp)
+}
+
+```
+
+
+Generate the data set:
+
+```{r}
+nsiz<-100000
+trydat<-makeTestDat(nsiz)
+summary(trydat)
+
+```
+
+Transform the data set into the random basis, and normalize the columns.
+
+```{r}
+
+acols<-1:2
+bcols<-3:4
+ccols<-5:6
+
+codtstdat<-makeRBaseDat(trydat,rbasis=xi,ncolv=list(acols,bcols,ccols))
+
+dim(codtstdat)
+
+marg<-apply(codtstdat,2,mean)
+codtstdat<-sweep(codtstdat,2,marg,"-")
+
+margsd<-apply(codtstdat,2,sd)
+codtstdat<-sweep(codtstdat,2,margsd,"/")
+
+
+```
+```{r}
+acols<-1:4
+ccols<-5:8
+bcols<-9:12
+resDat<-data.frame(matrix(0,nsiz,length(acols)+length(bcols)))
+names(resDat) <-names(codtstdat)[c(acols,bcols)]
+cvars<-paste0("c",1:4,collapse="+")
+paste("a1 ~ ",cvars,paste())
+for(i in 1:length(acols)){
+  fmla<-paste(names(codtstdat)[acols[i]]," ~ ",cvars)
+  resDat[,i]<-lm(fmla,data=codtstdat)$res
+}
+for(i in 1:length(bcols)){
+  fmla<-paste(names(codtstdat)[bcols[i]]," ~ ",cvars)
+  resDat[,i+length(acols)]<-lm(fmla,data=codtstdat)$res
+}
+    
+    
+pihat<-matrix(0,16,16)
+ro<-0
+co<-0
+for(i in 1:length(acols)){
+  for(j in 5:(4+length(bcols))){
+    ro<-ro+1
+    co<-0
+    for(k in 1:length(acols)){
+      for(ell in 5:(4+length(bcols))){
+        co<-co+1
+        pihat[ro,co]<-sum(resDat[,i]*resDat[,j]*resDat[,k]*resDat[,ell])
+      }
+    }
+  }
+}
+pihat<-pihat/nsiz
+pieig<-eigen(pihat)
+vsighat<-cov(codtstdat)
+corab<-c(solve(solve(vsighat)[c(acols,bcols),c(acols,bcols)])[1:4,5:8])
+
+normcorab<-diag(1/sqrt(pieig$values))%*%t(pieig$vectors)%*%matrix(corab,ncol=1)
+chis<-sum(normcorab^2)
+pval<-1-pchisq(chis,16)
+pval
+```
+
+Generate the dataset of crossproducts, and get the eigendecomposition.  The $\Pi$ matric is almost singlar.  I trade out values <1e20 for 1e20.  Finally, I calculate the square matrix with the root eigenvalues on the diagonal.
+
+```{r}
+
+acols<-1:4
+ccols<-5:8
+bcols<-9:12
+
+
+crossp<-makeCrossDat(codtstdat)
+vsighat<-apply(crossp,2,mean)
+
+pihat<-cov(crossp)
+pieig<-eigen(pihat)
+pieig$values<-ifelse(pieig$values>1e-20,pieig$values,1e-20)
+valroot<-diag(sqrt(pieig$values))
+
+
+
+```
+
+
+I use a monte carlo method to get an approximation for the test statistic. 
+
+```{r}
+
+B<-1000
+samCondCov<-matrix(0,B,16)
+for(b in 1:B){
+  vsigstar<-matrix(vsighat+
+                     pieig$vectors%*%valroot%*%matrix(rnorm(ncol(crossp))),
+                   sqrt(ncol(crossp)))
+  #vsigstar<-vsighat+
+  #                    pieig$vectors%*%valroot%*%matrix(rnorm(ncol(crossp)))/nsiz
+  
+#  samCondCov[b,]<-c(solve(solve(vsigstar)[c(acols,bcols),c(acols,bcols)])[1:4,5:8])
+  samCondCov[b,]<-c(solve(solve(vsigstar)[c(acols,bcols),c(acols,bcols)])[1:4,5:8])
+  
+}
+
+mCondCor<-apply(samCondCov,2,mean)
+covCondCov<-cov(samCondCov)
+# cholCondCov<-chol(covCondCov)
+# solve(t(cholCondCov),mCondCor)
+eigCovCondCov<-eigen(covCondCov)
+normVec<-(eigCovCondCov$vectors)%*%diag(sqrt(1/eigCovCondCov$values))%*%matrix(mCondCor)
+sum(normVec^2)
+
+```

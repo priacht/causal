@@ -1,0 +1,451 @@
+---
+title: "Notes About Causal Search and Inference"
+author: "Robin Fisher"
+output:
+  pdf_document:
+    fig_caption: yes
+  html_notebook: default
+  html_document: default
+bibliography: causSearch.bibtex
+---
+
+```{r echo=FALSE,message=FALSE}
+library(bnlearn)
+library(RSQLite)
+library(gRim)
+library(survey)
+library(ggplot2)
+library(ggm)
+library(abind)
+library(Rgraphviz)
+library(RBGL)
+library(gRain)
+library(pcalg)
+library(kpcalg)
+attrs <- list(node=list(shape="ellipse", fixedsize=FALSE))
+source(file="/home/robin/mcifunction/mci20191007.R")
+```
+
+
+These are notes on causal graphical models, especially in the context of nonparametric casual search where we do not make the assumption of *causal sufficiency*.  Think of them as an outline of the pieces we need to implement causal models. 
+
+##Preliminaries and Assumptions
+
+The basic assumption is that there is a causal DAG underlying the generation of the data.  Let $G=<V,E>$, where $V=O \dot\cup H \dot\cup S$, where $O$ repesents the observed variables, $H$, hidden or latent variables, and $S$ are selection variables.  We get our data by observing $O$, not observing $H$, thereby marginalizing it out, and conditioning on $S$.  
+
+The set of DAGs is not closed under marginalization or conditioning, but it is a subset of the set of Maximal Ancestral Graphs (MAGs), which is.  We'll assume that the data model is a MAG, $M=<O,E_O>$, where each edge $e \in E$  is a line where each end is $\rightarrow$, or $-$. $X \rightarrow Y$ means '$X$ causes $Y$ or some selection variable',  $X \leftrightarrow Y$ means $X$ and $Y$ have a common cause but neither causes a selection variable, $X-Y$ means $X$ and $Y$ are ancestors, and thus causes, of some members of $S$.  Methodology for the selection variable is less well developed, but I think it's important. There's some theory showing that if a bunch of variables all have the same common cause among latent variables, it can be represented with pairwise $\leftrightarrow$ (See [@pearl2009causality]).  If $G$ is an independence map (I-map) of the probability distribution of $V$ (say, $P(v)$) with *d-seperation*, $M$ is an I-map of $P(O)$ with *m-seperation* [@zhang2008causal]. Further, every MAG $M$ has a *canonical DAG* $\mathcal{D}(M)$, the projection of which is $M$.  $\mathcal{D}(M)$ is the minimal DAG with the corresponding MAG $M$. See [@richardson2002ancestral] for a discussion and an easy algorithm for finding $\mathcal{D}(M)$.  This seems important to me for a couple of reasons.  Since we can show that for any undelying causal graph, the data model is a MAG $M$, then I think the DAG $\mathcal{D}(M)$ represents a minimal faithful I-map of the data model.  This DAG can be converted to a decomposable model sutable for quick conditional probability calculations.  
+
+An important kind of $\rightarrow$ is the 'visible' arrow, which has identifiable characteristics in the graph.  From [@zhang2008causal], 
+
+> Definition 8 (Visibility) Given a MAG M , a directed edge A → B in M is v*isible *if there is a vertex
+C not adjacent to B, such that either there is an edge between C and A that is into A, or there is a
+collider path between C and A that is into A and every vertex on the path is a parent of B. Otherwise
+A → B is said to be *invisible*.
+
+[@perkovic2015complete] extended the definition of *visible* to include all arcs in a DAG or CPDAG.  I am a little confused, though.  Soemtimes a DAG is a PAG without ircle or double arrows.  Does this extension apply in this case?
+
+Also from [@perkovic2015complete]:
+
+>Definition   3.2.(Amenability for DAGs, CPDAGs, MAGs and PAGs) A DAG, CPDAG, MAG or PAG $\mathcal{G}$ is said to be *adjustment amenable*, relative to $(X,Y)$ if every possibly directed proper path from $X$ to $Y$ in $\mathcal{G}$ starts with a visible edge out of $X$.
+
+If the arrow is not visible, the causal relationship itself is identified but there may also be confounding or intermediary variables. [@perkovic2015complete] show that amenability, defined above, is a necessary condition for causal identifiability, so there must be a visible edge.  To get a visible edge, we need the instrument (maybe in the form of hte collider path) but, it turns out, the instument does not guarantee the existence of an adjustment set. I'll talk about that more below. I have an example of visibility in Figure \ref{graphMarg}.  
+
+Consider the following from [@pearl2009causality].
+
+>Theorem 3.6.1 A sufficient condition for identifying the causal effect $P(y|do(x))$ is that there exists no bi-directional path (i.e.,a path composed entirely if bi-directed arcs) between $X$ and any of its children.
+
+What is the definition of this kind of graph? Is it the same as a PAG without selection variables?  It is a presentation of a projection, where a latent variable in the canonical DAG is not shown but the double arrows are.  He also uses a mark for known directed paths, so i guess regular directed paths are like o-> path in a PAG.
+
+```{r echo=FALSE}
+dgtry<-DAG(c~a+b,d~c+b,e~a+b)
+```
+```{r echo=FALSE,fig.height=3,fig.width=3,fig.cap="DAG on the left; Center, $a$ is marginalized out; Right, $b$ is marginalized out.  Where $a$ is marginalized, out, there is a $\\leftrightarrow$ between $c$ and $e$.  On the right, where $b$ is marginalized out, there are $\\leftrightarrow$'s between $d$ and $e$ and between $c$ and $e$. There is a $\\rightarrow$ from $c$ to $d$ in the DAG which is preserved in the right graph, but it is confounded with a common parent.  This would be an *invisible* arc.  \\label{graphMarg}"}
+
+
+par(mfcol=c(1,3))
+plot(as(MAG(dgtry),"graphNEL"),attrs=attrs)
+plot(as(MAG(dgtry,M="a"),"graphNEL"),attrs=attrs)
+plot(as(MAG(dgtry,M="b"),"graphNEL"),attrs=attrs)
+par(mfcol=c(1,1))
+```
+
+Unfortunately, MAGS are not identifiable.  That is, even with perfect knowledge of the joint distribution of $O$, the set of MAGs which are I-maps of $P(O)$ typically has several members; sets defined this way are equivalence classes, with each class corresponding to an I-map over $O$.  We can represent such a class of MAGs with a *Partial Ancestral Graph* (PAG).  A PAG is a graph $Q=<O,E_O>$ where, this time, an edge $e \in E$  is a line, where each end is $\circ$, $\rightarrow$, or $-$.  $\circ$ implies that the ending of the line is not identifiable.  In a PAG, if we see an from $X$ to $Y$, that is, $X \rightarrow Y$, we have detected a causal relationship.  If it is *definitely visible*, where it visible for all MAGs in the equivalence  class defined by the PAG, we at least have a chance of identifying the causal effect. The other relationships from MAGs carry over in similar ways. 
+
+##Algorithms for Estimating the PAG when the underlying causal graph is a DAG
+
+
+###General 
+
+There are only a few algorithms to estimate the PAG.  There are a couple of ways to divide them up; the familiar division is by whether they make parametric assumptons or not.  the second is whether the algorithm is score-basd or constraint-based.  In score-based algorithms, there is some measure of how well the model fits the data, oftne with a penalty for complexity.  These methods are pretty well-developed for models with the causal sufficiency assumption or, models without the causal interpretation.  Constraint-based models estimate the set of conditional independence relations and use those to infer the structure of the PAG. 
+
+The most prominent of the algorithms suitable for nonparametric causal inference are the *FCI* and the *RFCI* algorithms (the Fast Causal Inference and Really Fast Causal Inference algorithms, respectively)  These, thogether with some variations, are the main algorithms known to be sound and complete, given an oracle.  While many algorithms such as the *pc* algorithm depend on an assumption that the set $O$ be causally identifiable, where there are no latent confounding variables, the FCI and RFCI algorithms do not. These algorithms estimate a collection of conditional indpendence (CI) relations by performing a bunch of CI tests. If the data set is large, there is considerable computational cost in the CI tests.  We would also like the tests to be nonparametric, which generally further increases the computer time.  The parametric/nonparametric part is determined by the nature of the tests.  If the multivariate normal assumption is used, we can use MVN-based tests.  
+
+In the nonparametric case, the CI tests are slow, and require a lot of computer time.  If the data are catergorical or have been binned,the usual tests of independence for contingnecy tables are available.  They are slow, however, and they break for large tables unless there are a lot of observations.  I have found this to be the biggest hurdle.  The FCI and RFCI algorithms are implemented in the *pcalg* package [@kalisch2012causal] in R [@Rbase].  Several faster nonparametric test are implemted [@kpcalgpackage].  Another faster CI test is proposed by [@strobl2017approximate], of which I have a buggy implementation.
+
+There is theory [@colombo2012learning] showing that these algorithms are consistent for the multivariate gaussian case, for sparse graphs in the large sample limit, provide the significance level of the tests goes to zero at an appropriate rate. Finding an appropriate significance for a given situation depends on quanities which must be estimated, however.  I also consier the multivariate gaussian assumption very restrictive, but that assumption does make the algorithms run fast. It is also a very popular assumption among, for example the Structural Equations Modelling (SEM) folks. 
+In general, for a fixed set of variables, here is an Argument I think we could make rigorous.  
+
+* Given an oracle for CI relationships, FCI and RFCI both return the 'correct' PAG
+* For each CI relationship hypothesis, for example, $H_0$: $X \perp\!\!\!\perp Y | Z$
+
+If the significance $\alpha \rightarrow 0$ and the power $1-\beta \rightarrow 1$, so P(H_0 is accepted or rejected correctly) $\rightarrow 1$ for every $X,Y,\mathbf{Z}$, so the estimated PAG converges to the true PAG in probability. I don't need *almost surely*.  
+
+This is nice, but convergence seems like it might be pretty slow, so such an argument seems pretty academic.  I would like a way to measure the reliability ofhe method for moderate or small data sets.  The bootstrap seems like a useful method.  In [jabbari2017obtaining] they go even a little further and calibrate bootstrap results to give probabilities for the presnce of arcs in a raphical model.  I haven't read that one yet.
+
+I include an example below. See [@zhang2008causal] for a detailed discussion of ancestral graphs and causal reasoning.
+
+For other kinds of graphical models, there are algorithms which search for an optimum score, such as a penalized likelihood, but, until recently, I thought no such algorithm was available for the causal seach problem.  A recent paper seems to provide one, though, based on the identification of Y-structures, and claims several nice properties. I don't know if there is an implementation of that algorithm.
+
+If we make the assumption that the dependence relationships can be expressed as a corelation matrix, it's pretty easy, but I would like to avoid that in spite of the fact that it is a common assumption.  Tax data, for example, has a lot of highly skewed data so the normal distribution part has to be finessed, and the relationships often involve thresholds or $max/min$-type functions.  I have tried to do it by binning the data, but the tables get to be infeasibly large.
+
+If we are testing $X \perp\!\!\!\perp Y | Z$, where $Z$ may be multivariate, There are some tests based on taking random functions of $X$, $Y$, and $Z$ from a suitable set and testing the null hypothesis of no correlation.  The idea is that if $X \perp\!\!\!\perp Y | Z$, then $cor(g_1(X),g_2(Y)|g_3(Z))=0$ for all $g_1,g_2,g_3$ and if $cor(g_1(X),g_2(Y)|g_3(Z))=0 ` \forall ~ sets \{g_1,g_2,g_3\}$, then $X \perp\!\!\!\perp Y | Z$. Then if we do the test of correlation on enough sets $\{g_1,g_2,g_3\}$, our chance of missing dependencies is low. I don't know of any quantification of 'low', however, except for some simulation results.  Anyway, applying the FCI or RFCI algorithms, with a suitable CI test, results in a PAG together with a list of seperating sets (*sep-sets*), which correspond to $Z$ in the CI relationship  $X \perp\!\!\!\perp Y | Z$.  
+
+###Work on guidance for $\alpha$ in hte discrete case
+
+The FCI and related algoriths use conditional independence tests to determine the existece of arcs.  As far as I know, there is no guidance in hte literature for choosing the significance level.  This is an important consideration; the significance levelcan't be interpreted in hte usual way, since many tests are done onthe same data.  Instead, we should think of it like a decision problem, where we need to minimize the risk; rather than using the significance level as a constraint, then we should arrange the test to miniize the probability of chossing wrong either way, since failng to reject the hypothsis of independence is as problematic as rejecting it wrongly.  
+
+I also consider it important to ensure that both error probabilities tend to zero as the sample size or, rather the degres of freedom increase.  That is, it should hold that, for variables $X$ qand $Y$ and a candidate seperator $Z$,
+
+
+\begin{eqnarray}
+\alpha \equiv P(rej H_0 | X \perp\!\!\!\perp Y | Z) \rightarrow 0, \\
+\beta \equiv P(do~not~rej ~H_0 | X \perp\!\!\!\perp Y | Z) \rightarrow 0 \\
+\end{eqnaray}
+
+as $df\rightarrow 0$.  It would be very handy, as well, to define this in terms of the significance in the standard G-test or $\chi^2$ test. The G-test has a basic definition in trems of hte Kullback-Liebler distance, giving a good interpretation, so I will proceed with that. $\ln$
+
+$$G = 2 \sum_{cells} \hat{\pi}_i \ln \left(\frac{\hat{\pi}_i}{\hat{\pi}_i(M)}\right) $$
+Where $\pi_i$ is the probability for the $i^{th}$ cell, the hat indicates the estimated proportion, and $\pi_i(M)$ is the closest distribution to $\pi_i$ under the model of independence in terms of the KL distance or, equivalently, the maxium likelihood estimate of $\pi$ under the assumption of independence. This has a noncentral $\chi^2$ distribution with noncentrality parameter
+
+$$\lambda=2df\sum_{cells} \pi_i \ln \left(\frac{\pi_i}{\pi_(M)} \right), $$
+Which is just $2dfKL(\pi||\pi(M))$.  This suggests the strategy where we select a value $\xi$ such that we are willing to neglect $KL(\pi||\pi(M))<\xi$.  I will talk about strtegies for choosing $\xi$ later but [@schulman2016stability] show how deviations from the true model affect the estimation of causal effects.
+
+We proceed by minimizing $L(\alpha)=\alpha+\beta(\alpha).$  
+\begin{eqnarray}
+L(\alpha) &=& \alpha+P(do~not~rej~H_0|KL=\xi) \\
+&=& \alpha + F_{\chi^2_{df,\lambda}}(F^{-1}_{\chi^2_{df}}(1-\alpha)) \\
+\frac{dL}{d\alpha}=1-\frac{f_{\chi^2_{df,\lambda}}(\chi^2_{1-\alpha})}{f_{\chi^2_{df,0}}(\chi^2_{1-\alpha})}.
+\end{eqnarray}
+
+Setting this to zero and rearranging gets us
+$$f_{\chi^2_{df,\lambda}}(\chi^2_{1-\alpha})=f_{\chi^2_{df,0}}(\chi^2_{1-\alpha}),$$
+which is the point at which the densities are equal.  We still need to figure out what the value of $\alpha$ that solves this equation.  The noncentral $\chi^2$ distribution is enerally intractale, so I will rely on the central limit theorem for the following apprximation.
+
+$$\frac{G}{df} \sim N \left(1+2KL,\frac{2}{df}(1+2KL)\right).$$
+
+Under the hypothesis of conditional independence, 
+
+$$\frac{G}{df} \sim N \left(1,\frac{2}{df}\right).$$
+Following a bunch of algebra, whihc I will inclde later, we get 
+
+$$\alpha=\Phi\left(-\xi \sqrt{\frac{df}{2}}\right).$$
+
+Which is fine, but I would like to let the R disCItest function figue out the value for $df$.  It is clear that $a \to 0$; I am pretty sure $\beta \to 0$ as well, but I will be explicit.
+
+#note to myself: look at the work leading up to the MAY 12 page
+
+
+###Score-based Algorithms
+
+I think I mentioned that score-based algorithms have not been as well-developed as constraint-based algorithms.  It may be that it's possible to just plug in the results of the CI tests into algorithms based on oracles.  The results are sensitive to each CI, test, though.
+
+An alternative is to maximize some score which measures some overall fitness of the model to the data.  [@mani2012theoretical] and [@mani2006causal] Approach this problem by looking for embedded Y-structures in the model.  An example of a Y-structure is given by in Figure \\ref{ystruc}.
+
+```{r echo=FALSE, fig.height=3,fig.width=3, fig.cap="Y-structure. \\label{ystruc}"}
+
+dgtry<-dag(~x:w1:w2,~z:x)
+plot(dgtry,attrs=attrs)
+
+```
+The strategy is to choose subsets of the variables in search of *embedded pure Y-structures*, which are just Y-structures on the mariginal distributions of the subset.  For any set of four variables, it's not very hard to find the score of all of them.  They suggest pretending that the posterior distribution is proportional to the score (not so fanciful, IMO, for some choices of score, like the AIC).  
+
+It seems natural to me to proceed with an MCI (see below) algorithm and let the precedence be determined by the 'posterior' when there is a conflict.  They use a different strategy, which is to  ....
+
+I am implementing this in R. The easiest way is to just use a search over the size-4 subset, and keep the score, then order the list by the score, and put that list into the MCI algorithm.  Note my implementation ofthat algorithm sets precedence by the order of the list, so this should work conveniently.  I need to be sure that the normalization constant isn't an issue. It shouldn't be if the subsets all come fromthe same data set.  I'm not so sure if they don't.
+
+I'm not sure about larger conditioning sets; It seems to me that these algorithms can only find a subset of those that the *FCI agorithms can find, so they would not be complete. That's an open question for me.
+##Algorithms for finding Adjustment varaibles for Causal effects once the PAG is known.  
+
+  The *gac* function in the *pcalg* package will identify adjustment variable for the causal effect of one vaiable on another, if it exists.  
+
+
+###The Generalized Adjustment Criterion
+
+Having the identifiable arc does not mean that the causal effect is identifiable, but there are algorithms that can find those that are.  In particular, we can find visible edges, then, once we have a visible edge, we can use the Generalized Adjustment Criterion (GAC), see [@perkovic2015complete], to test whether a set $\mathbf{Z}$ is an adjustment set; it is implement in the function *gac* in the package *pcalg*.  The function *adjustment* in *pcalg* provides a list of such adjustment sets, providied any exist. 
+
+If we soldier on trough this and find identifiable causal relationships, we get to estimate them using a regression method of some form or, more generally, we can estimate conditional distributions.  
+
+Finally, I think it is important to consider sensitivity of all of this to sampling or other errors.  There is theoretical guidance on the topic, fortunately. See [@schulman2016stability] 
+
+##Comining PAGs  
+One way we can use the PAGs is through the combination of PAGs from separate data sets over non-disjoint sets of variables.  The MCI algorithm uses the collection of sep-sets from the two data sets (because if it is true that $X \perp\!\!\!\perp Y | Z$ in either set, it's true in both) to form a new PAG over the union of he variables, and we may be able to detect new relationships.  See [@claassen2010causal].  I have an implementation of this algorithm.
+
+
+##More Examples
+
+```{r echo=FALSE, fig.height=3,fig.width=3, fig.cap="Underlying DAG for a data-generating process on the left; In the center, $x$,$y$, and $c$ are marginalized out.  It is not the case that $a \\perp\\!\\!\\!\\perp e | d$, since *a* is not d-seperated from *c* by *d*, which is a direct cause of *e*, and the causal effect of $a$ on $e$ is apparent, but the presence of mediating or confounding variables is not. On the right, $a$, $c$, and $e$ have been marginalized out. \\label{magExamp1}"}
+
+dgtry<-DAG(d~a+b+c,e~c+d,b~x+y)
+par(mfcol=c(1,3))
+plot(as(MAG(dgtry),"graphNEL"),attrs=attrs)
+#plot(as(MAG(dgtry,M="a"),"graphNEL"),attrs=attrs)
+plot(as(MAG(dgtry,M=c("c","x","y")),"graphNEL"),attrs=attrs)
+plot(as(MAG(dgtry,M=c("a","c","e")),"graphNEL"),attrs=attrs)
+par(mfcol=c(1,1))
+```
+
+Consider the following equations, which represent a model for which the graph in the left in Figure \ref{magExamp1} is the true underlying DAG.  $U$ denotes a $U(0,1)$ random variable; $Z$ is a standard normal random variable.  There is nothing special about the parameters; I just chose some that made the equations nonlinear, but I did not try to make the conditional independence tests very challenging.  In each case assume the random variables $U$ and $Z$ are drawn independently of the others.  
+
+
+\begin{eqnarray}
+x &=& Z_1/\sqrt{3} \\
+y &=& Z_2/\sqrt{3} \\
+a &=& U_1-0.5 \\
+b &=& x+y+Z_3/\sqrt{3}\\
+c &=& U_2-0.5 \\
+d&=&a+0.08b^3-0.3b+2|c|+(2U_3-1)/20 \\
+e &=&0.3c^2+0.1d+Z_4/2
+\end{eqnarray}
+
+
+I draw two samples, each of size 10000, independently from this system. In the first, I keep the values for $a$, $c$, $d$, and $e$. In the second I keep the values for $x$, $y$, $b$, and $d$.  I estimate the PAGs for each using the RFCI algorithm from the *pcalg* package in R and the *hsic.gamma* conditional independence test from the *kpcalg* package.   Figue \ref{magExamp2b} has the PAG for the observed variables $\{a,c,d,e\}$.
+
+
+```{r echo=FALSE, fig.height=3,fig.width=3, fig.cap="Estimated PAG for the simulated data from the equations above.   I used the *rfci* algorithm, implemented in the *pcalg* package in R, using the *hsic.gamma* test of conditional independence from the *kpcalg* package.  \\label{magExamp2b}"}
+
+load(file="sim1_2018-03-13.RData")
+plot(rfc2)
+```
+
+Here are the pairwise plots of the observed variables.
+
+
+
+```{r echo=FALSE, fig.height=4,fig.width=5, fig.cap="Pairwise scatterplots of the data generates from the functions in equations 1 through 5 above.  \\label{magExamp2c}"}
+pairs(abcde[,c("a","b","d","e")],pch=".")
+```
+
+Figure \ref{magExamp2d} has the PAG for the observed variables in the second dataset.
+
+```{r echo=FALSE, fig.height=3,fig.width=3, fig.cap="Estimated PAG for the simulated data from the equations above.   I used the *rfci* algorithm, implemented in the *pcalg* package in R, using the *hsic.gamma* test of conditional independence from the *kpcalg* package.  \\label{magExamp2d}"}
+
+load(file="sim_22018-03-13.RData")
+plot(rfc3)
+```
+
+
+
+##Combining the results from models on overlapping sets of variables
+
+```{r, echo=FALSE, fig.height=3,fig.width=3, fig.cap="Combination of graphs from figures above using the MCI algorithm \\label{mmciEx0}"}
+
+mci23<-mci(list(rfc2,rfc3))
+plot(mci23)
+
+```
+
+This seems to be an I-map of the original model, but not a perfect one.  We see, for example, that $a \perp\!\!\!\perp x | Z$
+
+##Example with MCI
+
+```{r echo=FALSE,message=FALSE}
+set.seed(959905)
+nsiz<-1000000
+prodSamp<-function(sampsize){
+  x<-rnorm(sampsize)
+  a<-rnorm(sampsize)
+  b<-a+4*x+rnorm(sampsize)
+  c<-2*a-3*b+rnorm(sampsize)
+  d<-4*b+5*c+rnorm(sampsize)
+  e<-6*d+7*c+rnorm(sampsize)/2
+  f<--4*d-e+rnorm(sampsize)/2
+  return(data.frame(cbind(x,a,b,c,d,e,f)))
+}
+
+abcdf<-prodSamp(nsiz)[,c("a", "b", "c", "d", "e", "f")]
+#pairs(abcde,pch=".")
+
+corm<-cor(abcdf)
+suffStat<-list(C = corm, n =nsiz)
+rfcf1<-rfci(suffStat=suffStat,indepTest =  gaussCItest, alpha = 0.001, 
+           labels =dimnames(corm)[[1]],
+           verbose=F)
+
+xabd<-prodSamp(nsiz)[,c("x","a", "b", "d")]
+corm<-cor(xabd)
+suffStat<-list(C = corm, n =nsiz)
+rfcf2<-rfci(suffStat=suffStat,indepTest =  gaussCItest, alpha = 0.001, 
+            labels =dimnames(corm)[[1]],
+            verbose=F)
+
+
+comb1<-mci(list(rfcf2,rfcf1))
+```
+
+Figure \ref{mciEx1} shows two PAGs from different sets of simulated variables from the same overall model.  On the left, the PAG is consistent with a triangulated undirected PGM, where there is no causal information.  On the right, A causal model on four variables.  We add one variable, $x$.  
+
+```{r, echo=FALSE, fig.height=3,fig.width=3, fig.cap="PAGs for some variables from two different data sets \\label{mciEx1}"}
+par(mfcol=c(1,2))
+plot(rfcf1)
+plot(rfcf2)
+par(mfcol=c(1,1))
+```
+Using the MCI algorithm, we get PAG in Figure \ref{mciExbb}. By adding the variable from the the second data set, we fully directed two arcs, $d \rightarrow f$ and $d \rightarrow e$.  We also partially directed two arcs, indicating $c$ does not cause $e$.
+
+```{r, echo=FALSE, fig.height=3,fig.width=3, fig.cap="A DAG representing and underying causal DAG on the left. On the right, the MAG when we condition on the variable $d$.  \\label{mciExbb}"}
+
+plot(comb1)
+
+```
+#Selection Bias
+
+Consider the following underlying DAG.  It is the same as in \ref{magExamp1} on the right, but I'm using a different plotting function.
+
+```{r echo=FALSE, fig.cap="A DAG representing and underying causal DAG on the left. On the right, the MAG when we condition on the variable $d$.  \\label{magWithSelV1}"}
+
+xy1<-t(matrix(c(40,50,
+           60,20,
+           70,50,
+           60,80,
+           30,90,
+           80,30,
+           80,70),2))
+xy1<-xy1[,2:1]
+xy2<-t(matrix(c(60,20,
+           70,50,
+           60,80,
+           30,90,
+           80,30,
+           80,70),2))
+
+xy2<-xy2[,2:1]
+
+par(mfcol=c(1,2))
+drawGraph(MAG(dgtry),coor=xy1)
+drawGraph(MAG(dgtry,C="d"),coor=xy2)
+par(mfcol=c(1,1))
+```
+
+The relationships between the other variables has really been muddied; $b$ still separates $x$ and $y$ from the other variables, but, otherwise, the MAG has little resemblance to the DAG. Only one causal arrow is identifiable, but the causal effect would not be. If we can get $P(S=1|V-S)$, we can do the weighting and fix the problem.  But ignore sampling weihgts at your peril.  
+
+It's also interesting. Say we drew the sample with the knowledge $d$ is always true or something.  All it ancestors have "--" lines, so are causal ancestors of $d$.   
+
+# Causal Models as Mininal PGMs and Imputation
+
+I think there is value in the PAG as a description of the dependencies among variables, even if we can't get estimate the casual effects.  The PAG keeps more information than is retained if we estimate either the BN or the UG models, as the BN and the UG models are special cases of the PAG; they are in fact special cases of the MAG, which subsumes those simpler graphical models.  See [@zhang2008completeness]
+
+If there is an underlying DAG as described above, the methods we have described find, in the large sample, a PAG representing the class of faithful Markov MAGs of the indepencdence relationships of the corresponding joint distribution.  Since the graphs are Markov with respect to that distribution, every *m-separation* relationship in the graph represents an independence relationship in the joint distribution.  Since it is faithful, there are no edges in the graph between varaibles not in each others' markov blankets.  The PGMs derived this way have the minimal numers of edges while remaining I-Maps of the distributions of the observed variables.  Models discovered this way have these desireable characteristics without regard to the causal interpretation.
+
+This is a desirable property when we do imputations; modeling either to many or too few CI relationships may contibute to errors in an analysis like a microsimulation.  These considerations are in tension with a desire for speedy computations.  Once a decomposable model has been constucted froma a PAG or MAG, the conditional distribution can be computed quickly at the cost of extra edges in the graph and extra members for some variables' Markov blankets.  Consider the example if Figure \ref{MRF1}.  The underlying DG is on the left; in the center it had been *moralized* on the right, it has been *triangulated*, whcih yield the decoposable model.  This is the easy one to work with, and it's the version we use, for example, on the state weights.  The fast *sum-product* algorithm converges in one iteration on these models, and the sufficient statitics are functions of the variables in each clique, leading to low(er)-dimensional problems.  While the sum-product algrotihm can be applied to the middle model, it may take a while to converge or may not converge and, if it does converge, may not converge to the right conditional probability.  It 'usually' does, but it's easy to see the advantage of the better-behaved one. As an aside, other algorithms may be used, like Monte Carlo methods, but they are slow.
+
+The other side of this is that, in the center, the MB of $X_5$ is $\{X_3,X_7\}$. In the decomposable model on the right, it is $\{X_1,X_3,X_4,X_6,X_7\}$.  If we could, we would like to use the MB for the model in the center to avoid introducing artifacts. I don't know how to do this in general, though, without falling back to slow methods.  In special cases, where we only care about one variable, we could just just take it and its MB out of the rest of the model and consider those variables in isolation.  In Figure \ref{MRF1}, if we just want to impute $X_5$, we could just condition on $\{X_3,X_7\}$.  If we want to impute different variables for different rows in a data set, we might like to be more effifient and use the mode on the right.  
+
+```{r echo=FALSE, fig.cap="\\label{MRF1}"}
+dg<-dag(~x2:x1,~x3:x1,~x4:x2,~x5:x3,~x6:x4,~x7:x5,~x8:x7:x6)
+dg2<-moralize(dg)
+dg3<-triangulate(dg2)
+
+par(mfcol=c(1,3))
+plot(dg,attrs=attrs)
+plot(dg2,attrs=attrs)
+plot(dg3,attrs=attrs)
+par(mfcol=c(1,1))
+```
+
+There is another question I have not resolved.  Consider a clique in the graph on the right, say $\{X_1,X_3,X_5\}$.  The joint distribution of that is factorable as $P(x_1,x_3,x_5)=\phi(x_1,x_3)\phi(x_3,x_5)$, and we could specify it that way when the time comes to parameterize the model in the decomposable version.  I don't know if that independence stucture is maintained when we find probabilities conditioned, for example, $X_8$.  I' don't think so, because we need to calcualte $P(x_1,x_5)$, as the separator between $\{X_1,X_3,X_5\}$ and $\{X_1,X_4,X_5\}$ as the marginalization over $X_3$ and $X_4$, so I'm not clear on this part.
+
+# Multivariate Gaussian Distributions
+
+I know I have been resistant to this kind of modeling assumption, but it is so common that I think it is worth some discussion. In the MultiVariate Normal (MVN) case, estimation and fitting is very easy.  The sufficient statistic for fitting the PAG is the pair containing the sample size and the correlation matrix, $<n,C>$.  The following illustrates the 
+
+
+```{r echo=FALSE, fig.cap="Causal Discovery Algrithm RFCI applied to Simulated data.  We use the same data as above, generated from equations (1)-(7), not observing $X$ or $Y$.  On the left, we assume the data was generated from a MVN distribution; the estimated PAG is somewhat different from the true PAG.  The estimation process took 0.03 secondson y laptop.  On the right, we used a nonparametric set of CI tests in the RFCI algorithm.  We got the true PAG, but the algorthm used more then 14 minutes on my laptop.  \\label{GGMAss}"}
+
+cormd<-cor(abcde)
+nd<-nrow(abcde)
+suffStat<-list(C = cormd, n = nd)
+par(mfcol=c(1,1))
+i<-0.4
+bf1<-Sys.time()
+rfc1<-rfci(suffStat=suffStat,indepTest =  gaussCItest, alpha = i, 
+           labels =dimnames(cormd)[[1]],
+           verbose=F)
+af1<-Sys.time()
+print(af1-bf1)
+#prec<-solve(corm)
+#prec
+#rfc1<-mci(list(rfc1))
+
+if(F){
+  B<-100
+  amatAve<-0*rfc1@amat
+  
+  cholCor<-chol(cormd)
+  
+  for(b in 1:B){
+    datRep<-data.frame(matrix(rnorm(nd*5),nd,5)%*%cholCor)
+    names(datRep)<-dimnames(cormd)[[1]]
+    corRep<-cor(datRep)
+    suffStat<-list(C = corRep, n = nd)
+    rfcRep<-rfci(suffStat=suffStat,indepTest =  gaussCItest, alpha = i, 
+                 labels =dimnames(cormd)[[1]],
+                 verbose=F)
+    amatAve<-amatAve+rfcRep@amat
+  }
+  amatAve<-amatAve/B
+  
+  rfcAve<-new("fciAlgo")
+  rfcAve@amat<-amatAve
+}
+
+
+# befor<-Sys.time()
+# i<-0.4
+#suffStat = list(data=abcde,ic.method="hsic.gamma")
+# rfckci<-rfci(suffStat=suffStat,indepTest =  kernelCItest, alpha = i,
+#            labels =dimnames(cormd)[[1]],
+#            verbose=F)
+# aft<-Sys.time()
+# save(rfckci,file="rfckci.RData")
+# eltime<-aft-befor
+# print(eltime) #14.11711 mins
+dur<-14.11711
+
+load(file="rfckci.RData")
+par(mfcol=c(1,2))
+plot(rfc1)
+plot(rfckci)
+par(mfcol=c(1,1))
+```
+
+The graph on the right of Figure \ref{GGMAss} is 
+
+
+
+##Applications in Economics
+
+[@moneta_2018] uses the PC algorithm on a data set of four variables, to investigate the existence and direction of causation between firm performance and exports.  It's a suprisingly simple data set.  He also noes that many economics graduate students are aware of these methods, but they are applied rarely.  The data is derived from two years of longitudinal data on firms; the variables are changes in variables.  *Expand this* 
+
+
+##Examples
+
+
+##more to include
+
+[@strobl2018constraint],*A Constraint-Based Algorithm For Causal Discovery with Cycles, Latent Variables and Selection Bias*
+
+[@loftus2018causal], *Causal Reasoning for Algorithmic Fairness*
+
+sokolova2016computing]
+
+* Canonical DAGS for MAGS
+    + MAGs, PAGs, Canonical DAGs, factor graphs
+    + Do factor graphs have the necessary independence information?  Is it generally possible to make a faithful factor graph?   if so, could we fit a factor graph then use a separation criterion for the consraint-based test
+* I would like to use a bootstrap or simulation method to test a result for a method in a given problem.  Is there theory saying whether this is a posibility?
+* How do we pick significance levels for costraint-based methods in finite data?
+* Survey Data
+* 
+
+
+#References
+

@@ -1,0 +1,101 @@
+---
+title: "About Involvement in Traditional and Electronic Bullying Among Adolescents"
+author: "Robin Fisher"
+date: "March 30, 2018"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+---
+
+This comes from a paper in *Developmental Psycholgy*, "Involvement in Traditional and Electronic Bullying Among Adolescents."  They ask a bunch of teenagers about bullying behavior or victimization.  Tehy try to guard against selction problems, but the stuff below seems to suggest it wasn't as effective as they'd hoped.
+
+Here are the variables, all binary, but treated as gaussian:
+
+* **PhysVict** Physical Victim
+* **TeasVict** Teasing Victim
+* **RumVict** Rumor Victim
+* **PictPhonVict** Picture-phone victim
+* **PhysBull** Physical Bully
+* **TeasBull** Teasing Bully
+* **RumBull** Rumor Bully
+* **ExclBull** Exclusion Bully
+* **IntbulL**Internet Bully
+* **TextMbULL**Text-message Bully
+
+
+
+They report a correlation matrix, which I could use as input to a causal search algorithm, fci+.
+```{r echo=FALSE, message=FALSE}
+
+library(bnlearn)
+library(RSQLite)
+library(gRim)
+library(survey)
+library(ggplot2)
+library(ggm)
+library(abind)
+library(Rgraphviz)
+library(RBGL)
+library(gRain)
+library(pcalg)
+library(kpcalg)
+
+library(MASS)
+#getting a correlation matrix from a file, importing a function, setting some variables
+source("~/mcifunction/mcifunction.R")
+attrs <- list(node=list(shape="ellipse", fixedsize=FALSE))
+setwd("~/causal")
+txt<-scan(file="capStruc.txt",what=character())
+
+n<-as.numeric(txt[1])
+
+namv<-txt[2:19]
+
+corm<-matrix(0,18,18)
+k<-20
+for(i in 1:18){
+  for(j in 1:i){
+    corm[i,j]<-as.numeric(txt[k])
+    corm[j,i]<-as.numeric(txt[k])
+    k<-k+1
+  }
+}
+
+dimnames(corm)<-list(namv,namv)
+covl<-list(n.obs=n,cov=corm)
+
+```
+
+$\alpha_n=2(1-\Phi(n^{1/2}c_n/2))$
+
+```{r}
+
+
+cn<-n^(-0.2)
+alph<-2*(1-pnorm(sqrt(n)*cn/2))
+alph
+suffStat<-list(C = corm, n = n)
+par(mfcol=c(1,1))
+for(i in c(0.2)){
+rfc1<-rfci(suffStat=suffStat,indepTest =  gaussCItest, alpha = i, 
+           labels =dimnames(corm)[[1]],
+           verbose=F)
+#prec<-solve(corm)
+#prec
+#rfc1<-mci(list(rfc1))
+plot(rfc1)
+}
+par(mfcol=c(1,1),attrs=attrs)
+```
+
+```{r}
+cm1<-cmod(~.^1,covl)
+cm1<-forward(cm1,k=log(n))
+cm1<-backward(cm1,k=log(n))
+plot(as(cm1,"graphNEL"),attrs=attrs)
+cm1NEL<-as(cm1,"graphNEL")
+
+cm1$glist
+
+```
